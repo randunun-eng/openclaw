@@ -622,5 +622,149 @@ describe("gateway server auth/connect", () => {
     }
   });
 
+  test("valid-signature device with wrong gateway token gets NOT_PAIRED error with requestId", async () => {
+    const { mkdtemp } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { loadOrCreateDeviceIdentity, publicKeyRawBase64UrlFromPem, signDevicePayload } =
+      await import("../infra/device-identity.js");
+    const { buildDeviceAuthPayload } = await import("./device-auth.js");
+    const prevToken = process.env.OPENCLAW_GATEWAY_TOKEN;
+    process.env.OPENCLAW_GATEWAY_TOKEN = "secret";
+    const port = await getFreePort();
+    const server = await startGatewayServer(port);
+    const identityDir = await mkdtemp(join(tmpdir(), "openclaw-device-pairing-"));
+    const identity = loadOrCreateDeviceIdentity(join(identityDir, "device.json"));
+    const signedAtMs = Date.now();
+    // Sign the payload with a wrong token — simulates Android sending shared gateway token
+    // Use x-forwarded-for to simulate a remote (non-local) client so silent auto-approve is NOT triggered
+    const ws = new WebSocket(`ws://127.0.0.1:${port}`, {
+      headers: { "x-forwarded-for": "203.0.113.10" },
+    });
+    await new Promise<void>((resolve) => ws.once("open", resolve));
+    const payload = buildDeviceAuthPayload({
+      deviceId: identity.deviceId,
+      clientId: GATEWAY_CLIENT_NAMES.TEST,
+      clientMode: GATEWAY_CLIENT_MODES.TEST,
+      role: "operator",
+      scopes: [],
+      signedAtMs,
+      token: "wrong-token",
+    });
+    const device = {
+      id: identity.deviceId,
+      publicKey: publicKeyRawBase64UrlFromPem(identity.publicKeyPem),
+      signature: signDevicePayload(identity.privateKeyPem, payload),
+      signedAt: signedAtMs,
+    };
+    const res = await connectReq(ws, {
+      token: "wrong-token",
+      device,
+      client: {
+        id: GATEWAY_CLIENT_NAMES.TEST,
+        version: "1.0.0",
+        platform: "android",
+        mode: GATEWAY_CLIENT_MODES.TEST,
+      },
+    });
+    expect(res.ok).toBe(false);
+    // Must be NOT_PAIRED, not unauthorized
+    expect(res.error?.message ?? "").toContain("pairing required");
+    const details = (res.error as { details?: { requestId?: unknown; deviceId?: unknown } } | undefined)?.details;
+    expect(typeof details?.requestId).toBe("string");
+    expect(details?.deviceId).toBe(identity.deviceId);
+    ws.close();
+    await server.close();
+    if (prevToken === undefined) {
+      delete process.env.OPENCLAW_GATEWAY_TOKEN;
+    } else {
+      process.env.OPENCLAW_GATEWAY_TOKEN = prevToken;
+    }
+  });
+
+  test("device with valid signature can connect after approveDevicePairing is called", async () => {
+    const { mkdtemp } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { loadOrCreateDeviceIdentity, publicKeyRawBase64UrlFromPem, signDevicePayload } =
+      await import("../infra/device-identity.js");
+    const { approveDevicePairing, getPairedDevice } = await import("../infra/device-pairing.js");
+    const { buildDeviceAuthPayload } = await import("./device-auth.js");
+    const prevToken = process.env.OPENCLAW_GATEWAY_TOKEN;
+    process.env.OPENCLAW_GATEWAY_TOKEN = "secret";
+    const port = await getFreePort();
+    const server = await startGatewayServer(port);
+    const identityDir = await mkdtemp(join(tmpdir(), "openclaw-device-pairing2-"));
+    const identity = loadOrCreateDeviceIdentity(join(identityDir, "device.json"));
+
+    const buildDevice = (token: string | null) => {
+      const signedAtMs = Date.now();
+      const payload = buildDeviceAuthPayload({
+        deviceId: identity.deviceId,
+        clientId: GATEWAY_CLIENT_NAMES.TEST,
+        clientMode: GATEWAY_CLIENT_MODES.TEST,
+        role: "operator",
+        scopes: [],
+        signedAtMs,
+        token,
+      });
+      return {
+        id: identity.deviceId,
+        publicKey: publicKeyRawBase64UrlFromPem(identity.publicKeyPem),
+        signature: signDevicePayload(identity.privateKeyPem, payload),
+        signedAt: signedAtMs,
+      };
+    };
+
+    // Step 1: First attempt — remote (non-local) client should get NOT_PAIRED with requestId
+    // Use x-forwarded-for to simulate a remote client so silent auto-approve is NOT triggered
+    const ws = new WebSocket(`ws://127.0.0.1:${port}`, {
+      headers: { "x-forwarded-for": "203.0.113.10" },
+    });
+    await new Promise<void>((resolve) => ws.once("open", resolve));
+    const res1 = await connectReq(ws, {
+      token: "wrong-token",
+      device: buildDevice("wrong-token"),
+      client: {
+        id: GATEWAY_CLIENT_NAMES.TEST,
+        version: "1.0.0",
+        platform: "android",
+        mode: GATEWAY_CLIENT_MODES.TEST,
+      },
+    });
+    expect(res1.ok).toBe(false);
+    const details = (res1.error as { details?: { requestId?: unknown } } | undefined)?.details;
+    const requestId = details?.requestId;
+    expect(typeof requestId).toBe("string");
+
+    // Step 2: Admin approves the pairing
+    const approved = await approveDevicePairing(String(requestId));
+    expect(approved).not.toBeNull();
+
+    ws.close();
+
+    // Step 3: Device reconnects with valid device token — should connect successfully
+    const paired = await getPairedDevice(identity.deviceId);
+    const deviceToken = paired?.tokens?.operator?.token;
+    expect(deviceToken).toBeDefined();
+
+    const ws2 = new WebSocket(`ws://127.0.0.1:${port}`);
+    await new Promise<void>((resolve) => ws2.once("open", resolve));
+    // Use the same device identity with a valid device token
+    const res2 = await connectReq(ws2, {
+      token: deviceToken,
+      device: buildDevice(deviceToken ?? null),
+    });
+    expect(res2.ok).toBe(true);
+
+    ws2.close();
+    await server.close();
+    if (prevToken === undefined) {
+      delete process.env.OPENCLAW_GATEWAY_TOKEN;
+    } else {
+      process.env.OPENCLAW_GATEWAY_TOKEN = prevToken;
+    }
+  });
+
   // Remaining tests require isolated gateway state.
 });

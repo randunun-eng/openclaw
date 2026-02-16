@@ -670,6 +670,69 @@ export function attachGatewayWsMessageHandler(params: {
             authMethod = "device-token";
           }
         }
+        // Allow valid-signature devices to trigger human-approved pairing flow
+        if (!authOk && device && devicePublicKey) {
+          const paired = await getPairedDevice(device.id);
+          if (paired?.publicKey === devicePublicKey) {
+            // Device was already approved by admin — allow through to receive device token
+            authOk = true;
+            authMethod = "device-token";
+          } else {
+            // Not yet approved — create pending pairing request for human approval
+            const pairing = await requestDevicePairing({
+              deviceId: device.id,
+              publicKey: devicePublicKey,
+              displayName: connectParams.client.displayName,
+              platform: connectParams.client.platform,
+              clientId: connectParams.client.id,
+              clientMode: connectParams.client.mode,
+              role,
+              scopes,
+              remoteIp: reportedClientIp,
+              silent: isLocalClient,
+            });
+            const context = buildRequestContext();
+            if (pairing.request.silent === true) {
+              // Local connection — auto-approve silently (same as existing behavior for local clients)
+              const approved = await approveDevicePairing(pairing.request.requestId);
+              if (approved) {
+                authOk = true;
+                authMethod = "device-token";
+                context.broadcast(
+                  "device.pair.resolved",
+                  {
+                    requestId: pairing.request.requestId,
+                    deviceId: approved.device.deviceId,
+                    decision: "approved",
+                    ts: Date.now(),
+                  },
+                  { dropIfSlow: true },
+                );
+              }
+            }
+            if (!authOk) {
+              if (pairing.created) {
+                context.broadcast("device.pair.requested", pairing.request, { dropIfSlow: true });
+              }
+              setHandshakeState("failed");
+              setCloseCause("pairing-required", {
+                deviceId: device.id,
+                requestId: pairing.request.requestId,
+                reason: "new-device",
+              });
+              send({
+                type: "res",
+                id: frame.id,
+                ok: false,
+                error: errorShape(ErrorCodes.NOT_PAIRED, "pairing required", {
+                  details: { requestId: pairing.request.requestId, deviceId: device.id },
+                }),
+              });
+              close(1008, "pairing required");
+              return;
+            }
+          }
+        }
         if (!authOk) {
           rejectUnauthorized();
           return;
