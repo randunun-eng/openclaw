@@ -173,7 +173,7 @@ export function renderApp(state: AppViewState) {
                 <span class="nav-label__chevron">${isGroupCollapsed ? "+" : "−"}</span>
               </button>
               <div class="nav-group__items">
-                ${group.tabs.map((tab) => renderTab(state, tab))}
+                ${group.tabs.map((tab) => renderTab(state, tab, tab === "nodes" && state.hasPendingPairingRequest))}
               </div>
             </div>
           `;

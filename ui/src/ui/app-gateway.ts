@@ -231,7 +231,12 @@ function handleGatewayEventUnsafe(host: GatewayHost, evt: GatewayEventFrame) {
     void loadCron(host as unknown as Parameters<typeof loadCron>[0]);
   }
 
-  if (evt.event === "device.pair.requested" || evt.event === "device.pair.resolved") {
+  if (evt.event === "device.pair.requested") {
+    (host as unknown as { hasPendingPairingRequest: boolean }).hasPendingPairingRequest = true;
+    void loadDevices(host as unknown as OpenClawApp, { quiet: true });
+  }
+
+  if (evt.event === "device.pair.resolved") {
     void loadDevices(host as unknown as OpenClawApp, { quiet: true });
   }
 

@@ -414,6 +414,17 @@
   color: var(--accent);
 }
 
+.nav-item__badge {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #e53e3e;
+  margin-left: auto;
+  flex-shrink: 0;
+  box-shadow: 0 0 0 2px var(--bg);
+}
+
 /* ===========================================
    Content Area
    =========================================== */

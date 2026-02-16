@@ -43,6 +43,7 @@ export type DevicesState = {
   devicesLoading: boolean;
   devicesError: string | null;
   devicesList: DevicePairingList | null;
+  hasPendingPairingRequest: boolean;
 };
 
 export async function loadDevices(state: DevicesState, opts?: { quiet?: boolean }) {
@@ -61,10 +62,14 @@ export async function loadDevices(state: DevicesState, opts?: { quiet?: boolean 
       pending?: Array<PendingDevice>;
       paired?: Array<PendingDevice>;
     }>("device.pair.list", {});
+    const pending = Array.isArray(res?.pending) ? res.pending : [];
     state.devicesList = {
-      pending: Array.isArray(res?.pending) ? res.pending : [],
+      pending,
       paired: Array.isArray(res?.paired) ? res.paired : [],
     };
+    if (pending.length === 0) {
+      state.hasPendingPairingRequest = false;
+    }
   } catch (err) {
     if (!opts?.quiet) {
       state.devicesError = String(err);
