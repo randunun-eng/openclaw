@@ -635,13 +635,21 @@ describe("gateway server auth/connect", () => {
     const server = await startGatewayServer(port);
     const identityDir = await mkdtemp(join(tmpdir(), "openclaw-device-pairing-"));
     const identity = loadOrCreateDeviceIdentity(join(identityDir, "device.json"));
-    const signedAtMs = Date.now();
     // Sign the payload with a wrong token — simulates Android sending shared gateway token
     // Use x-forwarded-for to simulate a remote (non-local) client so silent auto-approve is NOT triggered
     const ws = new WebSocket(`ws://127.0.0.1:${port}`, {
       headers: { "x-forwarded-for": "203.0.113.10" },
     });
+    // Register challenge listener BEFORE waiting for open to avoid race
+    const challengePromise = onceMessage<{ payload?: unknown }>(
+      ws,
+      (o) => o.type === "event" && o.event === "connect.challenge",
+    );
     await new Promise<void>((resolve) => ws.once("open", resolve));
+    const challenge = await challengePromise;
+    const nonce = (challenge.payload as { nonce?: unknown } | undefined)?.nonce;
+    expect(typeof nonce).toBe("string");
+    const signedAtMs = Date.now();
     const payload = buildDeviceAuthPayload({
       deviceId: identity.deviceId,
       clientId: GATEWAY_CLIENT_NAMES.TEST,
@@ -650,12 +658,14 @@ describe("gateway server auth/connect", () => {
       scopes: [],
       signedAtMs,
       token: "wrong-token",
+      nonce: String(nonce),
     });
     const device = {
       id: identity.deviceId,
       publicKey: publicKeyRawBase64UrlFromPem(identity.publicKeyPem),
       signature: signDevicePayload(identity.privateKeyPem, payload),
       signedAt: signedAtMs,
+      nonce: String(nonce),
     };
     const res = await connectReq(ws, {
       token: "wrong-token",
@@ -697,7 +707,7 @@ describe("gateway server auth/connect", () => {
     const identityDir = await mkdtemp(join(tmpdir(), "openclaw-device-pairing2-"));
     const identity = loadOrCreateDeviceIdentity(join(identityDir, "device.json"));
 
-    const buildDevice = (token: string | null) => {
+    const buildDevice = (token: string | null, nonce?: string) => {
       const signedAtMs = Date.now();
       const payload = buildDeviceAuthPayload({
         deviceId: identity.deviceId,
@@ -707,12 +717,14 @@ describe("gateway server auth/connect", () => {
         scopes: [],
         signedAtMs,
         token,
+        nonce,
       });
       return {
         id: identity.deviceId,
         publicKey: publicKeyRawBase64UrlFromPem(identity.publicKeyPem),
         signature: signDevicePayload(identity.privateKeyPem, payload),
         signedAt: signedAtMs,
+        ...(nonce !== undefined ? { nonce } : {}),
       };
     };
 
@@ -721,10 +733,18 @@ describe("gateway server auth/connect", () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}`, {
       headers: { "x-forwarded-for": "203.0.113.10" },
     });
+    // Register challenge listener BEFORE waiting for open to avoid race
+    const challengePromise1 = onceMessage<{ payload?: unknown }>(
+      ws,
+      (o) => o.type === "event" && o.event === "connect.challenge",
+    );
     await new Promise<void>((resolve) => ws.once("open", resolve));
+    const challenge1 = await challengePromise1;
+    const nonce1 = (challenge1.payload as { nonce?: unknown } | undefined)?.nonce;
+    expect(typeof nonce1).toBe("string");
     const res1 = await connectReq(ws, {
       token: "wrong-token",
-      device: buildDevice("wrong-token"),
+      device: buildDevice("wrong-token", String(nonce1)),
       client: {
         id: GATEWAY_CLIENT_NAMES.TEST,
         version: "1.0.0",
