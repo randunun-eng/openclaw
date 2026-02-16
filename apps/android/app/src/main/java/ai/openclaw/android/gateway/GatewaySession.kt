@@ -31,6 +31,8 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 
+data class PairingRequiredException(val requestId: String, val deviceId: String) : Exception("pairing required")
+
 data class GatewayClientInfo(
   val id: String,
   val displayName: String?,
@@ -61,6 +63,7 @@ class GatewaySession(
   private val onEvent: (event: String, payloadJson: String?) -> Unit,
   private val onInvoke: (suspend (InvokeRequest) -> InvokeResult)? = null,
   private val onTlsFingerprint: ((stableId: String, fingerprint: String) -> Unit)? = null,
+  private val onPairingRequired: ((requestId: String, deviceId: String) -> Unit)? = null,
 ) {
   data class InvokeRequest(
     val id: String,
@@ -78,7 +81,7 @@ class GatewaySession(
     }
   }
 
-  data class ErrorShape(val code: String, val message: String)
+  data class ErrorShape(val code: String, val message: String, val details: JsonElement? = null)
 
   private val json = Json { ignoreUnknownKeys = true }
   private val writeLock = Mutex()
@@ -193,7 +196,10 @@ class GatewaySession(
     suspend fun connect() {
       val scheme = if (tls != null) "wss" else "ws"
       val url = "$scheme://${endpoint.host}:${endpoint.port}"
-      val request = Request.Builder().url(url).build()
+      // Add Origin header so the server's browser-origin check passes for control-ui sessions.
+      val originScheme = if (tls != null) "https" else "http"
+      val origin = "$originScheme://${endpoint.host}:${endpoint.port}"
+      val request = Request.Builder().url(url).header("Origin", origin).build()
       socket = client.newWebSocket(request, Listener())
       try {
         connectDeferred.await()
@@ -258,6 +264,7 @@ class GatewaySession(
             val nonce = awaitConnectNonce()
             sendConnect(nonce)
           } catch (err: Throwable) {
+            Log.e("OpenClawGateway", "sendConnect failed: ${err::class.java.simpleName}: ${err.message}", err)
             connectDeferred.completeExceptionally(err)
             closeQuietly()
           }
@@ -301,6 +308,14 @@ class GatewaySession(
       val res = request("connect", payload, timeoutMs = 8_000)
       if (!res.ok) {
         val msg = res.error?.message ?: "connect failed"
+        val errorCode = res.error?.code
+        if (errorCode == "NOT_PAIRED") {
+          val details = res.error?.details?.asObjectOrNull()
+          val requestId = details?.get("requestId")?.asStringOrNull() ?: ""
+          val deviceIdFromServer = details?.get("deviceId")?.asStringOrNull() ?: ""
+          deviceAuthStore.clearToken(identity.deviceId, options.role)
+          throw PairingRequiredException(requestId, deviceIdFromServer)
+        }
         if (canFallbackToShared) {
           deviceAuthStore.clearToken(identity.deviceId, options.role)
         }
@@ -431,7 +446,8 @@ class GatewaySession(
         frame["error"]?.asObjectOrNull()?.let { obj ->
           val code = obj["code"].asStringOrNull() ?: "UNAVAILABLE"
           val msg = obj["message"].asStringOrNull() ?: "request failed"
-          ErrorShape(code, msg)
+          val details = obj["details"]
+          ErrorShape(code, msg, details)
         }
       pending.remove(id)?.complete(RpcResponse(id, ok, payloadJson, error))
     }
@@ -560,6 +576,10 @@ class GatewaySession(
         onDisconnected(if (attempt == 0) "Connecting…" else "Reconnecting…")
         connectOnce(target)
         attempt = 0
+      } catch (err: PairingRequiredException) {
+        onPairingRequired?.invoke(err.requestId, err.deviceId)
+        onDisconnected("Waiting for pairing approval\u2026")
+        delay(15_000L)
       } catch (err: Throwable) {
         attempt += 1
         onDisconnected("Gateway error: ${err.message ?: err::class.java.simpleName}")

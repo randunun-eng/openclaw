@@ -20,11 +20,13 @@ import ai.openclaw.android.gateway.GatewayDiscovery
 import ai.openclaw.android.gateway.GatewayEndpoint
 import ai.openclaw.android.gateway.GatewaySession
 import ai.openclaw.android.gateway.GatewayTlsParams
+import ai.openclaw.android.gateway.PairingRequiredException
 import ai.openclaw.android.node.CameraCaptureManager
 import ai.openclaw.android.node.LocationCaptureManager
 import ai.openclaw.android.BuildConfig
 import ai.openclaw.android.node.CanvasController
 import ai.openclaw.android.node.ScreenRecordManager
+import ai.openclaw.android.node.SmsInboxReader
 import ai.openclaw.android.node.SmsManager
 import ai.openclaw.android.protocol.OpenClawCapability
 import ai.openclaw.android.protocol.OpenClawCameraCommand
@@ -69,6 +71,7 @@ class NodeRuntime(context: Context) {
   val location = LocationCaptureManager(appContext)
   val screenRecorder = ScreenRecordManager(appContext)
   val sms = SmsManager(appContext)
+  val smsReader = SmsInboxReader(appContext)
   private val json = Json { ignoreUnknownKeys = true }
 
   private val externalAudioCaptureActive = MutableStateFlow(false)
@@ -144,6 +147,9 @@ class NodeRuntime(context: Context) {
   private val _isForeground = MutableStateFlow(true)
   val isForeground: StateFlow<Boolean> = _isForeground.asStateFlow()
 
+  private val _pairingRequestId = MutableStateFlow<String?>(null)
+  val pairingRequestId: StateFlow<String?> = _pairingRequestId.asStateFlow()
+
   private var lastAutoA2uiUrl: String? = null
   private var operatorConnected = false
   private var nodeConnected = false
@@ -157,6 +163,7 @@ class NodeRuntime(context: Context) {
       identityStore = identityStore,
       deviceAuthStore = deviceAuthStore,
       onConnected = { name, remote, mainSessionKey ->
+        _pairingRequestId.value = null
         operatorConnected = true
         operatorStatusText = "Connected"
         _serverName.value = name
@@ -184,6 +191,9 @@ class NodeRuntime(context: Context) {
       },
       onEvent = { event, payloadJson ->
         handleGatewayEvent(event, payloadJson)
+      },
+      onPairingRequired = { requestId, _ ->
+        _pairingRequestId.value = requestId
       },
     )
 
@@ -286,6 +296,9 @@ class NodeRuntime(context: Context) {
   val manualTls: StateFlow<Boolean> = prefs.manualTls
   val lastDiscoveredStableId: StateFlow<String> = prefs.lastDiscoveredStableId
   val canvasDebugStatusEnabled: StateFlow<Boolean> = prefs.canvasDebugStatusEnabled
+
+  private val _manualToken = MutableStateFlow(prefs.loadGatewayToken() ?: "")
+  val manualToken: StateFlow<String> = _manualToken.asStateFlow()
 
   private var didAutoConnect = false
   private var suppressWakeWordsSync = false
@@ -432,6 +445,12 @@ class NodeRuntime(context: Context) {
     prefs.setCanvasDebugStatusEnabled(value)
   }
 
+  fun setManualToken(token: String) {
+    val trimmed = token.trim()
+    prefs.saveGatewayToken(trimmed)
+    _manualToken.value = trimmed
+  }
+
   fun setWakeWords(words: List<String>) {
     prefs.setWakeWords(words)
     scheduleWakeWordsSyncIfNeeded()
@@ -470,6 +489,9 @@ class NodeRuntime(context: Context) {
       if (sms.canSendSms()) {
         add(OpenClawSmsCommand.Send.rawValue)
       }
+      if (smsReader.hasReadSmsPermission()) {
+        add(OpenClawSmsCommand.Inbox.rawValue)
+      }
     }
 
   private fun buildCapabilities(): List<String> =
@@ -478,6 +500,7 @@ class NodeRuntime(context: Context) {
       add(OpenClawCapability.Screen.rawValue)
       if (cameraEnabled.value) add(OpenClawCapability.Camera.rawValue)
       if (sms.canSendSms()) add(OpenClawCapability.Sms.rawValue)
+      if (smsReader.hasReadSmsPermission()) add(OpenClawCapability.SmsRead.rawValue)
       if (voiceWakeMode.value != VoiceWakeMode.Off && hasRecordAudioPermission()) {
         add(OpenClawCapability.VoiceWake.rawValue)
       }
@@ -537,7 +560,7 @@ class NodeRuntime(context: Context) {
   private fun buildOperatorConnectOptions(): GatewayConnectOptions {
     return GatewayConnectOptions(
       role = "operator",
-      scopes = emptyList(),
+      scopes = listOf("operator.read", "operator.admin", "operator.approvals", "operator.pairing"),
       caps = emptyList(),
       commands = emptyList(),
       permissions = emptyMap(),
@@ -747,7 +770,67 @@ class NodeRuntime(context: Context) {
   }
 
   fun sendChat(message: String, thinking: String, attachments: List<OutgoingAttachment>) {
-    chat.sendMessage(message = message, thinkingLevel = thinking, attachments = attachments)
+    val enriched = maybeEnrichWithSmsData(message)
+    chat.sendMessage(message = enriched, thinkingLevel = thinking, attachments = attachments)
+  }
+
+  private fun maybeEnrichWithSmsData(message: String): String {
+    val lower = message.lowercase()
+    val isFinanceQuery = lower.contains("sms") ||
+      lower.contains("finance") || lower.contains("financ") ||
+      lower.contains("bank") || lower.contains("credit card") ||
+      lower.contains("expense") || lower.contains("spending") ||
+      lower.contains("balance") || lower.contains("cashflow") ||
+      lower.contains("cash flow") || lower.contains("statement") ||
+      lower.contains("due date") || lower.contains("settle")
+    if (!isFinanceQuery) return message
+    if (!smsReader.hasReadSmsPermission()) return message
+
+    // Read more messages but we'll filter down to financial ones only
+    val result = smsReader.read("""{"limit":500}""")
+    if (!result.ok || result.count == 0) return message
+
+    // Filter to only bank/financial/utility senders to keep payload small
+    val financialKeywords = listOf(
+      "sampath", "combank", "commercial", "hnb", "hatton", "hsbc", "boc", "ntb",
+      "nations", "seylan", "dfcc", "pan asia", "peoples", "nsb", "ceylinco",
+      "amex", "visa", "mastercard",
+      "dialog", "mobitel", "slt", "airtel",
+      "ceb", "leco", "water", "insurance", "cooperative",
+      "bank", "card", "credit", "debit", "payment", "transfer",
+    )
+
+    // Parse the JSON to filter messages
+    val financialMessages = try {
+      val element = kotlinx.serialization.json.Json.parseToJsonElement(result.payloadJson)
+      val obj = element as? kotlinx.serialization.json.JsonObject
+      val messages = obj?.get("messages") as? kotlinx.serialization.json.JsonArray
+      messages?.filter { item ->
+        val msg = item as? kotlinx.serialization.json.JsonObject ?: return@filter false
+        val from = (msg["from"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.lowercase() ?: ""
+        val body = (msg["body"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.lowercase() ?: ""
+        financialKeywords.any { kw -> from.contains(kw) || body.contains(kw) }
+      }?.take(100) ?: emptyList()
+    } catch (_: Throwable) {
+      emptyList()
+    }
+
+    if (financialMessages.isEmpty()) return message
+
+    // Format as plain text (much smaller than JSON, easier for AI)
+    val sdf = java.text.SimpleDateFormat("dd MMM HH:mm", java.util.Locale.getDefault())
+    val textBlock = buildString {
+      append("\n\n---\n[Financial SMS: ${financialMessages.size} messages from banks/utilities]\n\n")
+      for (item in financialMessages) {
+        val msg = item as? kotlinx.serialization.json.JsonObject ?: continue
+        val from = (msg["from"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: ""
+        val body = (msg["body"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: ""
+        val ts = (msg["timestamp"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toLongOrNull() ?: 0L
+        val date = if (ts > 0) sdf.format(java.util.Date(ts)) else "?"
+        append("[$date] $from: $body\n")
+      }
+    }
+    return message + textBlock
   }
 
   private fun handleGatewayEvent(event: String, payloadJson: String?) {
@@ -1050,6 +1133,17 @@ class NodeRuntime(context: Context) {
           val error = res.error ?: "SMS_SEND_FAILED"
           val idx = error.indexOf(':')
           val code = if (idx > 0) error.substring(0, idx).trim() else "SMS_SEND_FAILED"
+          GatewaySession.InvokeResult.error(code = code, message = error)
+        }
+      }
+      OpenClawSmsCommand.Inbox.rawValue -> {
+        val res = smsReader.read(paramsJson)
+        if (res.ok) {
+          GatewaySession.InvokeResult.ok(res.payloadJson)
+        } else {
+          val error = res.error ?: "SMS_READ_FAILED"
+          val idx = error.indexOf(':')
+          val code = if (idx > 0) error.substring(0, idx).trim() else "SMS_READ_FAILED"
           GatewaySession.InvokeResult.error(code = code, message = error)
         }
       }
