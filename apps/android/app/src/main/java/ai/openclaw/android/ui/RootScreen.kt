@@ -22,14 +22,19 @@ import androidx.webkit.WebViewFeature
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.Icon
@@ -37,6 +42,7 @@ import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ScreenShare
@@ -88,6 +94,7 @@ fun RootScreen(viewModel: MainViewModel) {
   val talkIsSpeaking by viewModel.talkIsSpeaking.collectAsState()
   val seamColorArgb by viewModel.seamColorArgb.collectAsState()
   val seamColor = remember(seamColorArgb) { ComposeColor(seamColorArgb) }
+  val pairingRequestId by viewModel.pairingRequestId.collectAsState()
   val audioPermissionLauncher =
     rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
       if (granted) viewModel.setTalkEnabled(true)
@@ -261,6 +268,46 @@ fun RootScreen(viewModel: MainViewModel) {
         onClick = { sheet = Sheet.Settings },
         icon = { Icon(Icons.Default.Settings, contentDescription = "Settings") },
       )
+    }
+  }
+
+  if (pairingRequestId != null) {
+    Popup(alignment = Alignment.TopStart, properties = PopupProperties(focusable = false)) {
+      Column(
+        modifier = Modifier
+          .windowInsetsPadding(safeOverlayInsets)
+          .padding(top = 72.dp)
+          .fillMaxWidth(),
+      ) {
+        Card(
+          modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+          colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.primaryContainer
+          ),
+        ) {
+          Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+              text = "Pairing Request Sent",
+              style = MaterialTheme.typography.titleMedium,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+              text = "Open the OpenClaw dashboard and approve this device to connect.",
+              style = MaterialTheme.typography.bodyMedium,
+            )
+            if (pairingRequestId!!.isNotBlank()) {
+              Spacer(modifier = Modifier.height(4.dp))
+              Text(
+                text = "Request ID: ${pairingRequestId!!.take(8)}\u2026",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+            }
+          }
+        }
+      }
     }
   }
 
