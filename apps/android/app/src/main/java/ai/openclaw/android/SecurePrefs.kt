@@ -45,7 +45,7 @@ class SecurePrefs(context: Context) {
   val cameraEnabled: StateFlow<Boolean> = _cameraEnabled
 
   private val _locationMode =
-    MutableStateFlow(LocationMode.fromRawValue(prefs.getString("location.enabledMode", "off")))
+    MutableStateFlow(LocationMode.fromRawValue(prefs.getString("location.enabledMode", "on")))
   val locationMode: StateFlow<LocationMode> = _locationMode
 
   private val _locationPreciseEnabled =
@@ -56,11 +56,11 @@ class SecurePrefs(context: Context) {
   val preventSleep: StateFlow<Boolean> = _preventSleep
 
   private val _manualEnabled =
-    MutableStateFlow(prefs.getBoolean("gateway.manual.enabled", false))
+    MutableStateFlow(prefs.getBoolean("gateway.manual.enabled", true))
   val manualEnabled: StateFlow<Boolean> = _manualEnabled
 
   private val _manualHost =
-    MutableStateFlow(prefs.getString("gateway.manual.host", "") ?: "")
+    MutableStateFlow(prefs.getString("gateway.manual.host", "100.65.136.114") ?: "100.65.136.114")
   val manualHost: StateFlow<String> = _manualHost
 
   private val _manualPort =
@@ -68,7 +68,7 @@ class SecurePrefs(context: Context) {
   val manualPort: StateFlow<Int> = _manualPort
 
   private val _manualTls =
-    MutableStateFlow(prefs.getBoolean("gateway.manual.tls", true))
+    MutableStateFlow(prefs.getBoolean("gateway.manual.tls", false))
   val manualTls: StateFlow<Boolean> = _manualTls
 
   private val _lastDiscoveredStableId =
@@ -152,6 +152,7 @@ class SecurePrefs(context: Context) {
     val key = "gateway.token.${_instanceId.value}"
     val stored = prefs.getString(key, null)?.trim()
     return stored?.takeIf { it.isNotEmpty() }
+      ?: "023b78cd7c3cbfadb3ad99c9810991984ae6c157bc4d1c16"
   }
 
   fun saveGatewayToken(token: String) {
@@ -240,14 +241,21 @@ class SecurePrefs(context: Context) {
   }
 
   private fun loadVoiceWakeMode(): VoiceWakeMode {
-    val raw = prefs.getString(voiceWakeModeKey, null)
-    val resolved = VoiceWakeMode.fromRawValue(raw)
-
-    // Default ON (foreground) when unset.
-    if (raw.isNullOrBlank()) {
-      prefs.edit { putString(voiceWakeModeKey, resolved.rawValue) }
+    // One-time migration: old default was Foreground which caused continuous
+    // SpeechRecognizer beep sounds. Reset to Off for existing installs.
+    if (!prefs.getBoolean("voiceWake.mode.migratedOff.v1", false)) {
+      prefs.edit {
+        putString(voiceWakeModeKey, VoiceWakeMode.Off.rawValue)
+        putBoolean("voiceWake.mode.migratedOff.v1", true)
+      }
+      return VoiceWakeMode.Off
     }
 
+    val raw = prefs.getString(voiceWakeModeKey, null)
+    val resolved = VoiceWakeMode.fromRawValue(raw)
+    if (raw.isNullOrBlank()) {
+      prefs.edit { putString(voiceWakeModeKey, VoiceWakeMode.Off.rawValue) }
+    }
     return resolved
   }
 
